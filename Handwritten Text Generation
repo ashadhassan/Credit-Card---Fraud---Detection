@@ -1,0 +1,185 @@
+# char_rnn_handwritten.py
+# Character-level RNN (LSTM) to learn patterns from handwritten text transcription
+# and generate new text. Afterwards we render generated text using a handwriting font.
+
+import os
+import random
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from PIL import Image, ImageDraw, ImageFont
+
+# --------------------------
+# User settings / paths
+# --------------------------
+DATA_PATH = "handwritten_corpus.txt"   # Plain text file containing many lines of handwritten transcriptions
+MODEL_SAVE = "char_rnn_handwritten.h5"
+SEQ_LENGTH = 100   # length of input sequences (chars)
+BATCH_SIZE = 64
+BUFFER_SIZE = 10000
+EPOCHS = 30        # change as needed
+EMBEDDING_DIM = 256
+RNN_UNITS = 512
+GENERATE_LENGTH = 800  # number of characters to generate
+TEMPERATURE = 0.8       # sampling temperature (0.2..1.2 typical)
+
+# --------------------------
+# 1. Load corpus
+# --------------------------
+if not os.path.exists(DATA_PATH):
+    raise FileNotFoundError(f"Put your handwritten text corpus at: {DATA_PATH}. Each line should be a transcription.")
+
+with open(DATA_PATH, "r", encoding="utf-8") as f:
+    text = f.read()
+
+print(f"Corpus length (chars): {len(text)}")
+
+# Optionally: do simple cleaning (lowercase, keep basic punctuation). Adjust as per dataset.
+# Here we preserve case; if your data is noisy, you can lower() or remove uncommon chars.
+# text = text.lower()
+
+# --------------------------
+# 2. Create character vocabulary
+# --------------------------
+vocab = sorted(list(set(text)))
+vocab_size = len(vocab)
+print("Unique chars (vocab size):", vocab_size)
+# char->id and id->char
+char2idx = {c:i for i,c in enumerate(vocab)}
+idx2char = np.array(vocab)
+
+# --------------------------
+# 3. Encode whole text as ints
+# --------------------------
+text_as_int = np.array([char2idx[c] for c in text], dtype=np.int32)
+
+# --------------------------
+# 4. Prepare training sequences using tf.data
+# --------------------------
+# Create training examples / targets
+char_dataset = tf.data.Dataset.from_tensor_slices(text_as_int)
+
+sequences = char_dataset.batch(SEQ_LENGTH+1, drop_remainder=True)
+
+def split_input_target(chunk):
+    input_text = chunk[:-1]
+    target_text = chunk[1:]
+    return input_text, target_text
+
+dataset = sequences.map(split_input_target)
+
+dataset = dataset.shuffle(BUFFER_SIZE).batch(BATCH_SIZE, drop_remainder=True)
+dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
+
+# --------------------------
+# 5. Build the model
+#    Embedding -> LSTM(s) -> Dense(vocab)
+# --------------------------
+def build_model(vocab_size, embedding_dim, rnn_units, batch_size):
+    model = models.Sequential([
+        layers.Embedding(vocab_size, embedding_dim, batch_input_shape=[batch_size, None]),
+        layers.LSTM(rnn_units, return_sequences=True, stateful=True, recurrent_initializer='glorot_uniform'),
+        layers.LSTM(rnn_units, return_sequences=True, stateful=True, recurrent_initializer='glorot_uniform'),
+        layers.Dense(vocab_size)
+    ])
+    return model
+
+model = build_model(vocab_size=vocab_size, embedding_dim=EMBEDDING_DIM, rnn_units=RNN_UNITS, batch_size=BATCH_SIZE)
+model.summary()
+
+# --------------------------
+# 6. Loss and compile
+# --------------------------
+def loss(labels, logits):
+    return tf.keras.losses.sparse_categorical_crossentropy(labels, logits, from_logits=True)
+
+model.compile(optimizer='adam', loss=loss)
+
+# --------------------------
+# 7. Checkpoint callback to save weights between epochs (optional)
+# --------------------------
+checkpoint_dir = './checkpoints'
+os.makedirs(checkpoint_dir, exist_ok=True)
+checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
+    filepath=os.path.join(checkpoint_dir, "ckpt_{epoch}"),
+    save_weights_only=True
+)
+
+# --------------------------
+# 8. Train
+# --------------------------
+print("Starting training... (this may take time depending on dataset and epochs)")
+model.fit(dataset, epochs=EPOCHS, callbacks=[checkpoint_callback])
+
+# After training, save the full model weights
+model.save(MODEL_SAVE)
+print("Model saved to", MODEL_SAVE)
+
+# --------------------------
+# 9. For generation we rebuild model with batch_size=1 and load weights
+# --------------------------
+gen_model = build_model(vocab_size=vocab_size, embedding_dim=EMBEDDING_DIM, rnn_units=RNN_UNITS, batch_size=1)
+gen_model.load_weights(MODEL_SAVE)
+gen_model.build(tf.TensorShape([1, None]))
+
+# --------------------------
+# 10. Sampling function with temperature
+# --------------------------
+def sample_text(model, start_string, num_generate=500, temperature=1.0):
+    # Converting start string to numbers (vectorizing)
+    input_eval = [char2idx[s] if s in char2idx else random.randint(0, vocab_size-1) for s in start_string]
+    input_eval = tf.expand_dims(input_eval, 0)  # batch 1
+
+    text_generated = []
+    model.reset_states()
+    for i in range(num_generate):
+        predictions = model(input_eval)  # (1, seq_len, vocab_size)
+        predictions = predictions[:, -1, :]  # (1, vocab_size)
+        predictions = predictions / (temperature + 1e-8)
+        predicted_id = tf.random.categorical(predictions, num_samples=1)[-1,0].numpy()
+        # append predicted char
+        text_generated.append(idx2char[predicted_id])
+        # use predicted char as next input
+        input_eval = tf.expand_dims([predicted_id], 0)
+
+    return start_string + "".join(text_generated)
+
+# --------------------------
+# 11. Generate sample outputs
+# --------------------------
+seed = "Dear "
+generated = sample_text(gen_model, start_string=seed, num_generate=GENERATE_LENGTH, temperature=TEMPERATURE)
+print("------ GENERATED TEXT ------")
+print(generated)
+print("----------------------------")
+
+# --------------------------
+# 12. Optional: render generated text to an image using handwriting font
+# --------------------------
+def render_text_to_image(text, output_path="generated_handwritten.png", font_path="handwriting.ttf", font_size=36, line_width=80, padding=20):
+    # Wrap text by line_width characters (naive wrap)
+    lines = []
+    for i in range(0, len(text), line_width):
+        lines.append(text[i:i+line_width])
+
+    # estimate image size
+    try:
+        font = ImageFont.truetype(font_path, font_size)
+    except IOError:
+        print(f"Font {font_path} not found. Using default font.")
+        font = ImageFont.load_default()
+
+    max_line_width = max([font.getsize(line)[0] for line in lines]) + 2*padding
+    total_height = sum([font.getsize(line)[1] for line in lines]) + 2*padding
+
+    img = Image.new("RGB", (max_line_width, total_height), color="white")
+    draw = ImageDraw.Draw(img)
+    y = padding
+    for line in lines:
+        draw.text((padding, y), line, font=font, fill="black")
+        y += font.getsize(line)[1]
+    img.save(output_path)
+    print("Saved handwritten-style image to", output_path)
+
+# Example: ensure you have a handwriting font (handwriting.ttf) in current directory or provide path
+render_text_to_image(generated, output_path="generated_handwritten.png", font_path="handwriting.ttf", font_size=30)
